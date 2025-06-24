@@ -1,4 +1,3 @@
-// server.js (updated for full Retell + OpenAI + Function Calling support)
 require('dotenv').config();
 const { OpenAI } = require('openai');
 const WebSocket = require('ws');
@@ -210,7 +209,9 @@ app.get('/', (req, res) => res.send('LLM WebSocket Server Running'));
 
 app.get('/create-call', async (req, res) => {
   try {
-    const call = await retellClient.webCall.create({ voice_id: '11labs-Adrian' });
+    const call = await retellClient.createWebCall({
+      voice_id: 'uYXf8XasLslADfZ2MB4u' // ← Replace this
+    });
     res.json({ call_id: call.call_id, access_token: call.access_token });
   } catch (err) {
     console.error('Retell Web Call creation failed:', err.message);
