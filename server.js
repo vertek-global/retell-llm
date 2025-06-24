@@ -210,7 +210,7 @@ app.get('/', (req, res) => res.send('LLM WebSocket Server Running'));
 app.get('/create-call', async (req, res) => {
   try {
     const call = await retellClient.createWebCall({
-      voice_id: 'uYXf8XasLslADfZ2MB4u' // ← Replace this
+      voice_id: 'custom_voice_195d654509614b738bbee594d7' // ← Replace this
     });
     res.json({ call_id: call.call_id, access_token: call.access_token });
   } catch (err) {
