@@ -29,9 +29,13 @@ const agentPrompt = "As Todd's voice assistant, manage daily life and business. 
 class DemoLlmClient {
   constructor() {
     this.lastResponseId = 0;
+    this.greetedSessions = new Set(); // ✅ Prevent duplicate greetings
   }
 
-  async BeginMessage(ws) {
+  async BeginMessage(ws, sessionId) {
+    if (this.greetedSessions.has(sessionId)) return;
+    this.greetedSessions.add(sessionId);
+
     const greeting = getGreeting();
     const res = {
       response_type: 'agent_interrupt',
@@ -172,7 +176,7 @@ wss.on('connection', (ws, req) => {
 
   ws.send(JSON.stringify({ response_type: 'config', config: { auto_reconnect: true, call_details: true } }));
 
-  setTimeout(() => llmClient.BeginMessage(ws), 4000);
+  setTimeout(() => llmClient.BeginMessage(ws, sessionId), 4000);
 
   const pingInterval = setInterval(() => llmClient.sendPingPong(ws), 5000);
   const keepAliveInterval = setInterval(() => llmClient.sendKeepAlive(ws), 10000);
