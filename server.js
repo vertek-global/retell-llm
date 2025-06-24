@@ -209,12 +209,14 @@ app.get('/', (req, res) => res.send('LLM WebSocket Server Running'));
 
 app.get('/create-call', async (req, res) => {
   try {
-    const call = await retellClient.createWebCall({
-      voice_id: 'custom_voice_195d654509614b738bbee594d7' // ← Replace this
+    const call = await retellClient.call.createWebCall({
+      agent_id: 'agent_fcc4e87421295f5ce0ea944da8',
+      call_type: 'web_call'
     });
+    console.log("✅ Created Retell Web Call:", call.call_id);
     res.json({ call_id: call.call_id, access_token: call.access_token });
   } catch (err) {
-    console.error('Retell Web Call creation failed:', err.message);
+    console.error('❌ Retell Web Call creation failed:', err.message);
     res.status(500).send('Failed to create Retell call');
   }
 });
