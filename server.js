@@ -1,3 +1,4 @@
+// server.js (updated for full Retell + OpenAI + Function Calling support)
 require('dotenv').config();
 const { OpenAI } = require('openai');
 const WebSocket = require('ws');
@@ -5,24 +6,17 @@ const express = require('express');
 const { DateTime } = require('luxon');
 const Retell = require('retell-sdk');
 
-console.log('🔐 Loaded ENV - OPENAI_API_KEY:', process.env.OPENAI_API_KEY?.slice(0, 6));
-
 const app = express();
 const port = process.env.PORT || 3000;
-
-if (!port) {
-  console.error('PORT environment variable not set');
-  process.exit(1);
-}
-
 const server = app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
 
 const wss = new WebSocket.Server({ server });
 const activeConnections = new Map();
-
+const sessionConversations = new Map();
 const retellClient = new Retell({ apiKey: process.env.RETELL_API_KEY });
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 function getGreeting() {
   const hour = DateTime.now().setZone('America/Mexico_City').hour;
@@ -32,8 +26,6 @@ function getGreeting() {
 }
 
 const agentPrompt = "As Todd's voice assistant, manage daily life and business. Be concise, friendly, proactive.";
-
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 class DemoLlmClient {
   constructor() {
@@ -50,170 +42,183 @@ class DemoLlmClient {
       no_interruption_allowed: true,
       end_call: false,
     };
-
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(res));
-      console.log(`Sent BeginMessage at: ${DateTime.now().setZone('America/Mexico_City').toISO()}, content: ${greeting}`);
+      console.log(`Sent BeginMessage: ${greeting}`);
     }
   }
 
-  ConversationToChatRequestMessages(conversation) {
-    if (!conversation) return [];
-    return conversation.map(turn => ({
+  ConversationToChatRequestMessages(convo) {
+    return convo.map(turn => ({
       role: turn.role === 'agent' ? 'assistant' : 'user',
       content: turn.content,
     }));
   }
 
-  sendPingPong(ws) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'ping_pong', timestamp: Date.now() }));
-      console.log(`Sent ping_pong at: ${DateTime.now().setZone('America/Mexico_City').toISO()}`);
-    }
-  }
+  async DraftResponse(request, ws, sessionId) {
+    if (request.interaction_type === 'call_details' || request.interaction_type === 'update_only') return;
 
-  async DraftResponse(request, ws) {
-    if (request.interaction_type === 'call_details' || request.interaction_type === 'update_only') {
-      console.log(`${request.interaction_type} at ${DateTime.now().setZone('America/Mexico_City').toISO()}:`, request);
-      return;
-    }
+    if (!sessionConversations.has(sessionId)) sessionConversations.set(sessionId, []);
+    const conversation = sessionConversations.get(sessionId);
 
-    const requestMessages = this.ConversationToChatRequestMessages(request.transcript);
-    requestMessages.unshift({
-      role: 'system',
-      content: `You are Todd's voice AI assistant, like ChatGPT Voice. Be concise (under 10 words), friendly, and proactive. Use casual language, occasional fillers (e.g., 'um', hey). Guess intent for ASR errors, say 'huh?' or 'static?' if unclear. End with questions or suggestions. Role: ${agentPrompt}`,
-    });
+    const requestMessages = [
+      {
+        role: 'system',
+        content: `You are Todd's voice AI assistant. ${agentPrompt}`
+      },
+      ...this.ConversationToChatRequestMessages(request.transcript || [])
+    ];
+
     if (request.interaction_type === 'reminder_required') {
       requestMessages.push({ role: 'user', content: '(User silent, nudge them:)' });
     }
 
-    const options = {
-      model: 'gpt-4o',
-      temperature: 0.7,
-      max_tokens: 100,
-      stream: true,
-      frequency_penalty: 0.5,
-    };
-
-    try {
-      const stream = await openai.chat.completions.create({ messages: requestMessages, ...options });
-
-      let fullContent = '';
-      for await (const chunk of stream) {
-        if (chunk.choices?.[0]?.delta?.content) {
-          const content = chunk.choices[0].delta.content;
-          fullContent += content;
+    const tools = [{
+      type: "function",
+      function: {
+        name: "end_call",
+        description: "End the call when user clearly indicates they are done.",
+        parameters: {
+          type: "object",
+          properties: {
+            message: {
+              type: "string",
+              description: "Goodbye message to say before ending the call."
+            }
+          },
+          required: ["message"]
         }
       }
+    }];
 
-      if (ws.readyState === WebSocket.OPEN) {
+    const stream = await openai.chat.completions.create({
+      messages: requestMessages,
+      model: 'gpt-4o',
+      stream: true,
+      tools,
+      temperature: 0.7,
+      max_tokens: 100
+    });
+
+    let funcCall = null;
+    let funcArgs = '';
+    let fullContent = '';
+
+    for await (const chunk of stream) {
+      const delta = chunk.choices?.[0]?.delta;
+      if (!delta) continue;
+
+      if (delta.tool_calls?.length) {
+        const call = delta.tool_calls[0];
+        if (call.id && call.function?.name === "end_call") {
+          funcCall = { id: call.id, funcName: call.function.name, arguments: {} };
+        } else if (call.function?.arguments) {
+          funcArgs += call.function.arguments;
+        }
+      } else if (delta.content) {
+        fullContent += delta.content;
         ws.send(JSON.stringify({
           response_type: 'response',
           response_id: request.response_id,
-          content: fullContent,
-          content_complete: true,
-          end_call: false,
-        }));
-        console.log(`Sent LLM response at: ${DateTime.now().setZone('America/Mexico_City').toISO()}, content: ${fullContent}`);
-      }
-    } catch (err) {
-      console.error(`LLM error at: ${DateTime.now().setZone('America/Mexico_City').toISO()}`, err.message);
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({
-          response_type: 'response',
-          response_id: request.response_id,
-          content: 'Static? Something broke, Todd!',
-          content_complete: true,
+          content: delta.content,
+          content_complete: false,
           end_call: false,
         }));
       }
+    }
+
+    if (funcCall && funcCall.funcName === 'end_call') {
+      funcCall.arguments = JSON.parse(funcArgs);
+      ws.send(JSON.stringify({
+        response_type: 'response',
+        response_id: request.response_id,
+        content: funcCall.arguments.message,
+        content_complete: true,
+        end_call: true
+      }));
+    } else {
+      ws.send(JSON.stringify({
+        response_type: 'response',
+        response_id: request.response_id,
+        content: '',
+        content_complete: true,
+        end_call: false
+      }));
+      conversation.push({ role: 'user', content: request.transcript?.slice(-1)[0]?.content || '' });
+      conversation.push({ role: 'agent', content: fullContent });
     }
   }
 
+  sendPingPong(ws) {
+    ws.send(JSON.stringify({ type: 'ping_pong', timestamp: Date.now() }));
+  }
+
   sendKeepAlive(ws) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'keep_alive', timestamp: Date.now() }));
-      console.log(`Sent keep_alive at: ${DateTime.now().setZone('America/Mexico_City').toISO()}`);
-    }
+    ws.send(JSON.stringify({ type: 'keep_alive', timestamp: Date.now() }));
   }
 }
 
 const llmClient = new DemoLlmClient();
 
 wss.on('connection', (ws, req) => {
-  const callId = req.url.split('/').pop();
-  console.log(`WebSocket connection attempt for call_id: ${callId} at ${DateTime.now().setZone('America/Mexico_City').toISO()}`);
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const callId = url.pathname.split('/').pop();
+  const sessionId = url.searchParams.get('session_id') || callId;
 
   if (activeConnections.has(callId)) {
-    console.warn(`Duplicate connection for ${callId}, closing new connection`);
-    ws.close(1008, 'Duplicate connection detected');
+    ws.close(1008, 'Duplicate connection');
     return;
   }
   activeConnections.set(callId, ws);
 
-  ws.send(JSON.stringify({
-    response_type: 'config',
-    config: {
-      auto_reconnect: true,
-      call_details: true,
-    },
-  }));
-  console.log(`Sent config at: ${DateTime.now().setZone('America/Mexico_City').toISO()}`);
+  ws.send(JSON.stringify({ response_type: 'config', config: { auto_reconnect: true, call_details: true } }));
 
-  llmClient.BeginMessage(ws);
+  setTimeout(() => llmClient.BeginMessage(ws), 4000);
 
   const pingInterval = setInterval(() => llmClient.sendPingPong(ws), 5000);
   const keepAliveInterval = setInterval(() => llmClient.sendKeepAlive(ws), 10000);
 
-  ws.on('message', (message, isBinary) => {
-    if (isBinary) {
-      console.error(`Binary message for ${callId} at ${DateTime.now().setZone('America/Mexico_City').toISO()}, length: ${message.length}`);
-      return;
-    }
-
+  ws.on('message', async (message, isBinary) => {
+    if (isBinary) return;
     try {
       const request = JSON.parse(message.toString());
-      console.log(`Received for ${callId} at ${DateTime.now().setZone('America/Mexico_City').toISO()}:`, request);
       if (request.interaction_type === 'ping_pong') {
         llmClient.sendPingPong(ws);
       } else {
-        llmClient.DraftResponse(request, ws);
+        await llmClient.DraftResponse(request, ws, sessionId);
       }
     } catch (err) {
-      console.error(`Parse error for ${callId} at ${DateTime.now().setZone('America/Mexico_City').toISO()}:`, err.message);
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({
-          response_type: 'response',
-          response_id: 0,
-          content: 'Static? Try again, Todd!',
-          content_complete: true,
-          end_call: false,
-        }));
-        ws.close(1002, 'Cannot parse incoming message');
-      }
+      ws.send(JSON.stringify({
+        response_type: 'response',
+        response_id: 0,
+        content: 'Static? Try again, Todd!',
+        content_complete: true,
+        end_call: false
+      }));
+      ws.close(1002, 'Invalid JSON');
     }
   });
 
-  ws.on('close', (code, reason) => {
-    console.log(`WebSocket closed for ${callId} at ${DateTime.now().setZone('America/Mexico_City').toISO()}: code=${code}, reason=${reason.toString()}`);
+  ws.on('close', () => {
     activeConnections.delete(callId);
     clearInterval(pingInterval);
     clearInterval(keepAliveInterval);
-    if (code === 1000) {
-      console.warn(`Retell server closed connection for ${callId}, possible inactivity or API issue`);
-    } else if (code === 1008) {
-      console.warn(`Duplicate connection detected for ${callId}, client should request new callId`);
-    }
-  });
-
-  ws.on('error', (err) => {
-    console.error(`WebSocket error for ${callId} at ${DateTime.now().setZone('America/Mexico_City').toISO()}:`, err.message);
   });
 });
 
 app.get('/', (req, res) => res.send('LLM WebSocket Server Running'));
 
+app.get('/create-call', async (req, res) => {
+  try {
+    const call = await retellClient.webCall.create({ voice_id: '11labs-Adrian' });
+    res.json({ call_id: call.call_id, access_token: call.access_token });
+  } catch (err) {
+    console.error('Retell Web Call creation failed:', err.message);
+    res.status(500).send('Failed to create Retell call');
+  }
+});
+
 setInterval(() => {
   const memory = process.memoryUsage();
-  console.log(`Memory usage at ${DateTime.now().setZone('America/Mexico_City').toISO()}: RSS=${(memory.rss / 1024 / 1024).toFixed(2)}MB, Heap=${(memory.heapUsed / 1024 / 1024).toFixed(2)}MB`);
+  console.log(`Memory usage: RSS=${(memory.rss / 1024 / 1024).toFixed(2)}MB, Heap=${(memory.heapUsed / 1024 / 1024).toFixed(2)}MB`);
 }, 60000);
